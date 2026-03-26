@@ -1,0 +1,4 @@
+interface:
+  display_name: "Blocking Wait Handoff"
+  short_description: "Resume the same Codex session after a blocking wait"
+  default_prompt: "Use $blocking-wait-handoff to hand off a long blocking wait and resume the same Codex session when it finishes."
