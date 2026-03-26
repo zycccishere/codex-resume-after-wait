@@ -59,6 +59,19 @@ The script already enforces a 20-second preflight by default.
 - Inspect the failure immediately in the current session.
 - Only terminate the session after `schedule` returns `status: scheduled`.
 
+## Current Limits
+
+- This is not designed as a macOS-only skill.
+- The current implementation is tested on macOS with Unix-like process tools.
+- Local `--pattern` mode expects `pgrep`.
+- Remote monitoring expects `ssh`, `ps`, and `pgrep` on the remote host.
+- Windows has not been validated.
+- Local process watching is most reliable when Codex is running with full access or another mode that can inspect arbitrary local PIDs.
+- In tighter sandboxes, Codex may be unable to inspect or signal unrelated local processes.
+- Remote host monitoring can still be a better fit when local sandbox restrictions are tight.
+- The resume path depends on the `codex` CLI being available on the same machine and supporting `codex exec resume`.
+- The current implementation allows only one active handoff per Codex session.
+
 ## Common Invocations
 
 Local PID:

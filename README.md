@@ -37,6 +37,18 @@ This repository is intentionally named and described to match those queries.
 
 `codex`, `openai-codex`, `ai-agent`, `agentic-coding`, `job-scheduler`, `process-monitor`, `background-jobs`, `automation`, `developer-tools`, `long-running-tasks`
 
+## Current Limits
+
+- Not intended to be macOS-only, but the current implementation is tested on macOS with Unix-like process tools.
+- Local `--pattern` mode expects `pgrep`.
+- Remote monitoring expects `ssh`, `ps`, and `pgrep` on the remote host.
+- Windows has not been validated.
+- Local PID watching is most reliable when Codex has full access or another mode that can inspect arbitrary local processes.
+- In restricted sandboxes, local process inspection may fail even if the scheduler itself launches correctly.
+- Remote host monitoring is often the safer path when local sandbox limits are tight.
+- The resume path depends on the `codex` CLI being present on the same machine and supporting `codex exec resume`.
+- The current implementation supports one active wait handoff per Codex session.
+
 ## Local smoke checks
 
 ```bash
