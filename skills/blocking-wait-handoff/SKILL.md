@@ -1,6 +1,6 @@
 ---
 name: blocking-wait-handoff
-description: Hand off a genuinely blocking local or remote wait to an external watcher that resumes the same Codex session after the job exits. Use only when the launched job is expected to take more than five minutes, you cannot make progress without its result, and you have already verified that it survives an initial 20-second preflight without failing immediately.
+description: Hand off a genuinely blocking local or remote wait to an external watcher that resumes the same Codex session after the job exits or after a maximum wait window elapses. Use only when the launched job is expected to take more than five minutes, you cannot make progress without its result, and you have already verified that it survives an initial 20-second preflight without failing immediately.
 ---
 
 # Blocking Wait Handoff
@@ -25,7 +25,7 @@ It schedules a detached watcher that:
 
 1. verifies the target survives a 20-second preflight
 2. keeps polling outside the active Codex session
-3. resumes the same Codex session with `codex exec resume` after the watched process exits
+3. resumes the same Codex session with `codex exec resume` after the watched process exits or after the maximum wait time is reached
 
 The current session should stop after the handoff succeeds.
 Each Codex session may have only one active wait handoff at a time.
@@ -36,6 +36,18 @@ Use:
 
 ```bash
 python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py schedule ...
+```
+
+Before scheduling a new handoff, always inspect the currently live watch/resume chains first:
+
+```bash
+python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py active --json
+```
+
+If you find contradictory, duplicated, stale, or obsolete chains, stop them before scheduling a new one:
+
+```bash
+python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py stop --task-id <task_id> --json
 ```
 
 ## Required Decision Gate
@@ -59,6 +71,16 @@ The script already enforces a 20-second preflight by default.
 - Inspect the failure immediately in the current session.
 - Only terminate the session after `schedule` returns `status: scheduled`.
 
+## Max Wait
+
+- The watcher has a maximum wait limit.
+- Default: `7200` seconds (`2h`).
+- When the limit is reached, the watcher resumes Codex even if the process is still alive.
+- The resumed prompt explicitly says this was a timeout-style resume, not a success signal.
+- After a timeout-style resume, first confirm whether the run is healthy and progressing.
+- If it is healthy, schedule another blocking wait on the same precise target.
+- If it is unhealthy or stuck, diagnose, fix, relaunch if needed, and only then schedule a new blocking wait.
+
 ## Current Limits
 
 - This is not designed as a macOS-only skill.
@@ -71,6 +93,8 @@ The script already enforces a 20-second preflight by default.
 - Remote host monitoring can still be a better fit when local sandbox restrictions are tight.
 - The resume path depends on the `codex` CLI being available on the same machine and supporting `codex exec resume`.
 - The current implementation allows only one active handoff per Codex session.
+- By default, resumed sessions now use full permission and no sandbox via `codex exec resume --dangerously-bypass-approvals-and-sandbox`.
+- Use `--resume-preserve-approvals-and-sandbox` only when you explicitly want the resumed session to keep the normal Codex approval and sandbox settings.
 
 ## Common Invocations
 
@@ -115,6 +139,27 @@ python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py schedule \
   --resume-prompt-file tmp/wait-resume-prompt.md
 ```
 
+Override the default 2-hour maximum wait:
+
+```bash
+python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py schedule \
+  --blocking \
+  --expected-seconds 21600 \
+  --max-wait-seconds 14400 \
+  --host <remote_host> \
+  --pid 12345
+```
+
+Preserve the normal approval and sandbox settings on resume:
+
+```bash
+python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py schedule \
+  --blocking \
+  --expected-seconds 1800 \
+  --pid 12345 \
+  --resume-preserve-approvals-and-sandbox
+```
+
 Short test run for iteration:
 
 ```bash
@@ -155,6 +200,18 @@ Cancel a stale handoff:
 python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py cancel --task-id <task_id>
 ```
 
+List only live watch/resume processes:
+
+```bash
+python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py active --json
+```
+
+Stop a specific live chain cleanly:
+
+```bash
+python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py stop --task-id <task_id> --json
+```
+
 ## Guardrails
 
 - Do not use this for sub-5-minute waits.
@@ -163,3 +220,7 @@ python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py cancel --task
 - Do not use vague patterns such as `python`, `train`, or `node`.
 - Do not schedule a second handoff for the same session until the first one clears.
 - Prefer putting any detailed continuation instructions into a prompt file under `tmp/`.
+- Before every new `schedule`, run `active` and inspect the currently live watch/resume chains.
+- If you find contradictory, duplicated, or obsolete chains, stop them first. Do not let them pile up.
+- The default resume path now assumes the machine or container is already trusted and externally sandboxed.
+- Use `--resume-preserve-approvals-and-sandbox` when that assumption does not hold.
