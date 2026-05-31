@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,12 +20,34 @@ from typing import Any
 DEFAULT_PREFLIGHT_SECONDS = 20
 DEFAULT_POLL_SECONDS = 15
 DEFAULT_MAX_WAIT_SECONDS = 2 * 60 * 60
+DEFAULT_RESUME_RETRY_DELAY_SECONDS = 20 * 60
+DEFAULT_RESUME_RETRY_MAX_ATTEMPTS = 12
 DEFAULT_STATE_DIR = "tmp/codex-wait-handoff"
 ACTIVE_PHASES = {"scheduled", "watching"}
+RETRYABLE_RESUME_PATTERNS = (
+    "reconnecting...",
+    "stream disconnected before completion",
+    "error sending request for url",
+    "backend-api/codex/responses",
+    "connection reset",
+    "connection timed out",
+    "connection closed",
+    "network is unreachable",
+    "temporarily unavailable",
+    "tls handshake",
+)
 
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def utc_after(seconds: int) -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        + timedelta(seconds=max(int(seconds), 0))
+    ).isoformat().replace("+00:00", "Z")
 
 
 def fatal(message: str, exit_code: int = 1) -> "NoReturn":
@@ -58,6 +80,22 @@ def write_text(path: Path, text: str) -> None:
 def read_text(path: Path) -> str:
     with path.open("r", encoding="utf-8") as handle:
         return handle.read()
+
+
+def read_text_from_offset(path: Path, offset: int, max_chars: int = 20000) -> str:
+    if not path.exists():
+        return ""
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        handle.seek(max(offset, 0))
+        text = handle.read()
+    if len(text) > max_chars:
+        return text[-max_chars:]
+    return text
+
+
+def retryable_resume_failure(log_text: str) -> bool:
+    lowered = log_text.lower()
+    return any(pattern in lowered for pattern in RETRYABLE_RESUME_PATTERNS)
 
 
 def session_lock_key(session_id: str) -> str:
@@ -145,6 +183,22 @@ def descendants_by_pid(rows: list[dict[str, Any]], root_pid: int) -> list[int]:
     return ordered
 
 
+def self_and_ancestor_pids(rows: list[dict[str, Any]], pid: int | None = None) -> list[int]:
+    current_pid = int(pid or os.getpid())
+    parent_by_pid = {int(row["pid"]): int(row["ppid"]) for row in rows}
+    protected: list[int] = []
+    seen: set[int] = set()
+    probe = current_pid
+    while probe > 0 and probe not in seen:
+        seen.add(probe)
+        protected.append(probe)
+        next_probe = parent_by_pid.get(probe)
+        if next_probe is None or next_probe == probe:
+            break
+        probe = next_probe
+    return protected
+
+
 def task_related_pids(task_payload: dict[str, Any], rows: list[dict[str, Any]]) -> list[int]:
     task_id_value = str(task_payload.get("task_id") or "")
     if not task_id_value:
@@ -185,10 +239,38 @@ def task_runtime_snapshot(task_payload: dict[str, Any], rows: list[dict[str, Any
     }
 
 
-def terminate_pids(pids: list[int], grace_seconds: float = 3.0) -> dict[str, Any]:
-    live = [pid for pid in sorted(set(int(pid) for pid in pids if int(pid) > 0)) if pid_exists(int(pid))]
+def active_and_stale_task_snapshots(tasks_dir: Path, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    active_entries: list[dict[str, Any]] = []
+    stale_entries: list[dict[str, Any]] = []
+    for task_file in sorted(tasks_dir.glob("*.json")):
+        task_payload = load_json(task_file)
+        snapshot = task_runtime_snapshot(task_payload, rows)
+        if snapshot["related_pids"]:
+            active_entries.append(snapshot)
+            continue
+        if task_payload.get("phase") in {"scheduled", "watching", "resume_started"}:
+            stale_entries.append(snapshot)
+    return active_entries, stale_entries
+
+
+def terminate_pids(
+    pids: list[int],
+    grace_seconds: float = 3.0,
+    exclude_pids: list[int] | None = None,
+) -> dict[str, Any]:
+    excluded = sorted(set(int(pid) for pid in (exclude_pids or []) if int(pid) > 0))
+    live = [
+        pid
+        for pid in sorted(set(int(pid) for pid in pids if int(pid) > 0))
+        if pid not in excluded and pid_exists(int(pid))
+    ]
     if not live:
-        return {"requested_pids": sorted(set(pids)), "terminated_pids": [], "still_alive_pids": []}
+        return {
+            "requested_pids": sorted(set(int(pid) for pid in pids if int(pid) > 0)),
+            "excluded_pids": excluded,
+            "terminated_pids": [],
+            "still_alive_pids": [],
+        }
 
     for pid in reversed(live):
         try:
@@ -212,7 +294,12 @@ def terminate_pids(pids: list[int], grace_seconds: float = 3.0) -> dict[str, Any
     time.sleep(0.2)
     final_alive = [pid for pid in live if pid_exists(pid)]
     terminated = [pid for pid in live if pid not in final_alive]
-    return {"requested_pids": live, "terminated_pids": terminated, "still_alive_pids": final_alive}
+    return {
+        "requested_pids": live,
+        "excluded_pids": excluded,
+        "terminated_pids": terminated,
+        "still_alive_pids": final_alive,
+    }
 
 
 def ssh_command(host: str, remote_command: str, timeout_seconds: int | None = 30) -> subprocess.CompletedProcess[str]:
@@ -266,6 +353,131 @@ def probe_remote_pattern(host: str, pattern: str) -> tuple[str, str]:
     return ("unknown", result.stderr.strip() or result.stdout.strip() or f"pgrep exited with {result.returncode}")
 
 
+def stop_local_pid(pid: int) -> dict[str, Any]:
+    termination = terminate_pids([pid])
+    return {
+        "scope": "local",
+        "mode": "pid",
+        "requested_pid": pid,
+        "terminated_pids": termination["terminated_pids"],
+        "still_alive_pids": termination["still_alive_pids"],
+        "status": "stopped" if not termination["still_alive_pids"] else "still_alive",
+    }
+
+
+def stop_local_pattern(pattern: str) -> dict[str, Any]:
+    result = run_command(["pgrep", "-af", "--", pattern], timeout_seconds=10)
+    if result.returncode == 1:
+        return {
+            "scope": "local",
+            "mode": "pattern",
+            "pattern": pattern,
+            "matched_pids": [],
+            "terminated_pids": [],
+            "still_alive_pids": [],
+            "status": "already_absent",
+        }
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"pgrep exited with {result.returncode}"
+        return {"scope": "local", "mode": "pattern", "pattern": pattern, "status": "probe_failed", "detail": detail}
+    matched_pids: list[int] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if not parts:
+            continue
+        try:
+            matched_pids.append(int(parts[0]))
+        except ValueError:
+            continue
+    termination = terminate_pids(matched_pids)
+    return {
+        "scope": "local",
+        "mode": "pattern",
+        "pattern": pattern,
+        "matched_pids": matched_pids,
+        "terminated_pids": termination["terminated_pids"],
+        "still_alive_pids": termination["still_alive_pids"],
+        "status": "stopped" if not termination["still_alive_pids"] else "still_alive",
+    }
+
+
+def stop_remote_pid(host: str, pid: int) -> dict[str, Any]:
+    command = (
+        f"if ps -o stat= -p {pid} | head -n 1 >/dev/null 2>&1; then "
+        f"kill -TERM {pid} 2>/dev/null || true; "
+        f"sleep 1; "
+        f"if ps -o stat= -p {pid} | head -n 1 >/dev/null 2>&1; then "
+        f"kill -KILL {pid} 2>/dev/null || true; "
+        f"sleep 1; "
+        f"fi; "
+        f"if ps -o stat= -p {pid} | head -n 1 >/dev/null 2>&1; then "
+        f"echo still_alive; "
+        f"else echo stopped; fi; "
+        f"else echo already_absent; fi"
+    )
+    try:
+        result = ssh_command(host, command, timeout_seconds=30)
+    except subprocess.TimeoutExpired:
+        return {"scope": "remote", "mode": "pid", "host": host, "requested_pid": pid, "status": "probe_failed", "detail": "ssh timeout"}
+    detail = result.stderr.strip() or result.stdout.strip()
+    if result.returncode == 255:
+        return {"scope": "remote", "mode": "pid", "host": host, "requested_pid": pid, "status": "probe_failed", "detail": detail or "ssh returned 255"}
+    status = (result.stdout.strip().splitlines() or ["unknown"])[-1].strip()
+    return {
+        "scope": "remote",
+        "mode": "pid",
+        "host": host,
+        "requested_pid": pid,
+        "status": status if status in {"stopped", "still_alive", "already_absent"} else "unknown",
+        "detail": detail,
+    }
+
+
+def stop_remote_pattern(host: str, pattern: str) -> dict[str, Any]:
+    quoted_pattern = shlex.quote(pattern)
+    command = (
+        f"pids=$(pgrep -f -- {quoted_pattern} | tr '\\n' ' '); "
+        f"if [ -z \"$pids\" ]; then echo already_absent; exit 0; fi; "
+        f"kill -TERM $pids 2>/dev/null || true; "
+        f"sleep 1; "
+        f"alive=$(pgrep -f -- {quoted_pattern} | tr '\\n' ' '); "
+        f"if [ -n \"$alive\" ]; then kill -KILL $alive 2>/dev/null || true; sleep 1; fi; "
+        f"final=$(pgrep -f -- {quoted_pattern} | tr '\\n' ' '); "
+        f"if [ -n \"$final\" ]; then echo still_alive:$final; else echo stopped:$pids; fi"
+    )
+    try:
+        result = ssh_command(host, command, timeout_seconds=30)
+    except subprocess.TimeoutExpired:
+        return {"scope": "remote", "mode": "pattern", "host": host, "pattern": pattern, "status": "probe_failed", "detail": "ssh timeout"}
+    detail = result.stderr.strip() or result.stdout.strip()
+    if result.returncode == 255:
+        return {"scope": "remote", "mode": "pattern", "host": host, "pattern": pattern, "status": "probe_failed", "detail": detail or "ssh returned 255"}
+    last_line = (result.stdout.strip().splitlines() or ["unknown"])[-1].strip()
+    status = last_line.split(":", 1)[0]
+    return {
+        "scope": "remote",
+        "mode": "pattern",
+        "host": host,
+        "pattern": pattern,
+        "status": status if status in {"stopped", "still_alive", "already_absent"} else "unknown",
+        "detail": detail,
+    }
+
+
+def stop_target(target: dict[str, Any]) -> dict[str, Any]:
+    scope = target["scope"]
+    mode = target["mode"]
+    if scope == "local" and mode == "pid":
+        return stop_local_pid(int(target["pid"]))
+    if scope == "local" and mode == "pattern":
+        return stop_local_pattern(str(target["pattern"]))
+    if scope == "remote" and mode == "pid":
+        return stop_remote_pid(str(target["host"]), int(target["pid"]))
+    if scope == "remote" and mode == "pattern":
+        return stop_remote_pattern(str(target["host"]), str(target["pattern"]))
+    raise ValueError(f"Unsupported target: {target}")
+
+
 def probe_target(target: dict[str, Any]) -> tuple[str, str]:
     scope = target["scope"]
     mode = target["mode"]
@@ -310,6 +522,45 @@ def target_summary(target: dict[str, Any]) -> str:
     return prefix + f"pattern {target['pattern']!r}"
 
 
+def build_observed_log(args: argparse.Namespace, target: dict[str, Any], current_cwd: Path) -> dict[str, Any] | None:
+    if not args.observed_log:
+        if args.observed_log_host or args.observed_log_label:
+            fatal("--observed-log-host and --observed-log-label require --observed-log.")
+        return None
+
+    host = args.observed_log_host or (str(target["host"]) if target.get("scope") == "remote" else "")
+    scope = "remote" if host else "local"
+    raw_path = str(args.observed_log)
+    if scope == "remote":
+        if not raw_path.startswith("/"):
+            fatal("--observed-log must be an absolute remote path when the observed log is remote.")
+        return {
+            "scope": "remote",
+            "host": host,
+            "path": raw_path,
+            "label": args.observed_log_label or "Observed Log",
+        }
+
+    local_path = Path(raw_path).expanduser()
+    if not local_path.is_absolute():
+        local_path = current_cwd / local_path
+    return {
+        "scope": "local",
+        "path": str(local_path.resolve()),
+        "label": args.observed_log_label or "Observed Log",
+    }
+
+
+def observed_log_summary(observed_log: dict[str, Any] | None) -> str:
+    if not observed_log:
+        return ""
+    scope = observed_log.get("scope") or "local"
+    label = observed_log.get("label") or "Observed Log"
+    if scope == "remote":
+        return f"{label}: remote {observed_log.get('host')}:{observed_log.get('path')}"
+    return f"{label}: local {observed_log.get('path')}"
+
+
 def format_duration_brief(total_seconds: int) -> str:
     seconds = max(int(total_seconds), 0)
     hours, remainder = divmod(seconds, 3600)
@@ -328,6 +579,7 @@ def build_resume_prompt(
     task_id_value: str,
     task_file: Path,
     target: dict[str, Any],
+    observed_log: dict[str, Any] | None,
     note: str | None,
     prompt_text: str | None,
     completion_reason: str,
@@ -385,6 +637,9 @@ def build_resume_prompt(
             f"completion_reason: {completion_reason}",
         ]
     )
+    observed_log_text = observed_log_summary(observed_log)
+    if observed_log_text:
+        lines.append(f"observed_log: {observed_log_text}")
     if completion_detail:
         lines.append(f"completion_detail: {completion_detail}")
     if note:
@@ -527,6 +782,7 @@ def command_schedule(args: argparse.Namespace) -> int:
     preflight_seconds = max(args.preflight_seconds, 0)
     state_dirs = ensure_state_dirs(Path(args.state_dir).expanduser().resolve())
     current_cwd = Path(args.cwd).expanduser().resolve() if args.cwd else Path.cwd().resolve()
+    observed_log = build_observed_log(args, target, current_cwd)
 
     preflight_state, preflight_detail = do_preflight(target, preflight_seconds)
     if preflight_state == "dead":
@@ -559,6 +815,7 @@ def command_schedule(args: argparse.Namespace) -> int:
         task_id_value=task_id_value,
         task_file=task_file,
         target=target,
+        observed_log=observed_log,
         note=args.note,
         prompt_text=prompt_text,
         completion_reason="process_exited",
@@ -574,6 +831,7 @@ def command_schedule(args: argparse.Namespace) -> int:
         "session_id": session_id,
         "session_lock": str(lock_path),
         "target": target,
+        "observed_log": observed_log,
         "expected_seconds": args.expected_seconds,
         "max_wait_seconds": max_wait_seconds,
         "allow_short_test": bool(args.allow_short_test),
@@ -588,6 +846,8 @@ def command_schedule(args: argparse.Namespace) -> int:
         "task_file": str(task_file),
         "dry_run_resume": bool(args.dry_run_resume),
         "resume_bypass_approvals_and_sandbox": not bool(args.resume_preserve_approvals_and_sandbox),
+        "resume_retry_delay_seconds": max(int(args.resume_retry_delay_seconds), 1),
+        "resume_retry_max_attempts": max(int(args.resume_retry_max_attempts), 0),
         "continuation_prompt_text": prompt_text or "",
         "note": args.note or "",
     }
@@ -698,6 +958,7 @@ def command_watch(args: argparse.Namespace) -> int:
         task_id_value=task_payload["task_id"],
         task_file=task_file,
         target=target,
+        observed_log=task_payload.get("observed_log"),
         note=task_payload.get("note") or None,
         prompt_text=(task_payload.get("continuation_prompt_text") or "").strip() or None,
         completion_reason=str(task_payload.get("completion_reason") or "process_exited"),
@@ -709,10 +970,6 @@ def command_watch(args: argparse.Namespace) -> int:
     resume_log_file = Path(task_payload["resume_log_file"])
     last_message_file = Path(task_payload["last_message_file"])
     resume_cwd = Path(task_payload["resume_cwd"])
-
-    task_payload["phase"] = "resume_started"
-    task_payload["resume_started_at"] = now_utc()
-    write_json(task_file, task_payload)
 
     resume_command = [
         os.environ.get("CODEX_WAIT_CODEX_BIN", "codex"),
@@ -729,25 +986,94 @@ def command_watch(args: argparse.Namespace) -> int:
         task_payload["session_id"],
         "-",
     ])
-    print(f"[{now_utc()}] resuming session {task_payload['session_id']}", flush=True)
-    with resume_log_file.open("a", encoding="utf-8") as resume_log:
-        result = subprocess.run(
-            resume_command,
-            input=prompt_text,
-            text=True,
-            stdout=resume_log,
-            stderr=subprocess.STDOUT,
-            cwd=resume_cwd,
-            check=False,
-        )
+    retry_delay_seconds = max(
+        int(task_payload.get("resume_retry_delay_seconds", DEFAULT_RESUME_RETRY_DELAY_SECONDS) or 0),
+        1,
+    )
+    retry_max_attempts = max(
+        int(task_payload.get("resume_retry_max_attempts", DEFAULT_RESUME_RETRY_MAX_ATTEMPTS) or 0),
+        0,
+    )
+    resume_attempts = list(task_payload.get("resume_attempts") or [])
+    attempt = 0
+    while True:
+        attempt += 1
+        started_at = now_utc()
+        task_payload = load_json(task_file)
+        task_payload["phase"] = "resume_started"
+        task_payload["resume_started_at"] = task_payload.get("resume_started_at") or started_at
+        task_payload["resume_last_attempt_started_at"] = started_at
+        task_payload["resume_attempt"] = attempt
+        task_payload["resume_retry_delay_seconds"] = retry_delay_seconds
+        task_payload["resume_retry_max_attempts"] = retry_max_attempts
+        write_json(task_file, task_payload)
 
-    task_payload = load_json(task_file)
-    task_payload["resume_returncode"] = result.returncode
-    task_payload["resume_completed_at"] = now_utc()
-    task_payload["phase"] = "resume_ok" if result.returncode == 0 else "resume_failed"
-    write_json(task_file, task_payload)
-    print(f"[{now_utc()}] resume returncode={result.returncode}", flush=True)
-    return result.returncode
+        log_offset = resume_log_file.stat().st_size if resume_log_file.exists() else 0
+        print(
+            f"[{now_utc()}] resuming session {task_payload['session_id']} attempt={attempt}",
+            flush=True,
+        )
+        with resume_log_file.open("a", encoding="utf-8") as resume_log:
+            resume_log.write(f"\n[{now_utc()}] codex resume attempt {attempt} start\n")
+            resume_log.flush()
+            result = subprocess.run(
+                resume_command,
+                input=prompt_text,
+                text=True,
+                stdout=resume_log,
+                stderr=subprocess.STDOUT,
+                cwd=resume_cwd,
+                check=False,
+            )
+            resume_log.write(f"\n[{now_utc()}] codex resume attempt {attempt} returncode={result.returncode}\n")
+            resume_log.flush()
+
+        attempt_log = read_text_from_offset(resume_log_file, log_offset)
+        retryable = result.returncode != 0 and retryable_resume_failure(attempt_log)
+        completed_at = now_utc()
+        attempt_record = {
+            "attempt": attempt,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "returncode": result.returncode,
+            "retryable": retryable,
+        }
+        resume_attempts.append(attempt_record)
+
+        task_payload = load_json(task_file)
+        task_payload["resume_returncode"] = result.returncode
+        task_payload["resume_completed_at"] = completed_at
+        task_payload["resume_last_attempt_completed_at"] = completed_at
+        task_payload["resume_attempts"] = resume_attempts
+
+        if result.returncode == 0:
+            task_payload["phase"] = "resume_ok"
+            write_json(task_file, task_payload)
+            print(f"[{now_utc()}] resume returncode=0 attempt={attempt}", flush=True)
+            return 0
+
+        attempts_remaining = retry_max_attempts == 0 or attempt < retry_max_attempts
+        if retryable and attempts_remaining:
+            task_payload["phase"] = "resume_retry_waiting"
+            task_payload["resume_retry_reason"] = "retryable_network_disconnect"
+            task_payload["resume_next_retry_delay_seconds"] = retry_delay_seconds
+            task_payload["resume_next_retry_after"] = utc_after(retry_delay_seconds)
+            write_json(task_file, task_payload)
+            print(
+                f"[{now_utc()}] resume returncode={result.returncode} attempt={attempt}; "
+                f"detected retryable network disconnect; retrying in {retry_delay_seconds}s",
+                flush=True,
+            )
+            time.sleep(retry_delay_seconds)
+            continue
+
+        task_payload["phase"] = "resume_failed"
+        task_payload["resume_retry_reason"] = (
+            "retryable_network_disconnect_attempts_exhausted" if retryable else "non_retryable_resume_failure"
+        )
+        write_json(task_file, task_payload)
+        print(f"[{now_utc()}] resume returncode={result.returncode} attempt={attempt}", flush=True)
+        return result.returncode
 
 
 def command_status(args: argparse.Namespace) -> int:
@@ -788,16 +1114,7 @@ def command_active(args: argparse.Namespace) -> int:
         fatal(f"State directory does not exist: {state_dir}")
 
     rows = process_rows()
-    active_entries: list[dict[str, Any]] = []
-    stale_entries: list[dict[str, Any]] = []
-    for task_file in sorted(tasks_dir.glob("*.json")):
-        task_payload = load_json(task_file)
-        snapshot = task_runtime_snapshot(task_payload, rows)
-        if snapshot["related_pids"]:
-            active_entries.append(snapshot)
-            continue
-        if task_payload.get("phase") in {"scheduled", "watching", "resume_started"}:
-            stale_entries.append(snapshot)
+    active_entries, stale_entries = active_and_stale_task_snapshots(tasks_dir, rows)
 
     payload = {
         "active_tasks": active_entries,
@@ -818,11 +1135,13 @@ def command_cancel(args: argparse.Namespace) -> int:
     task_payload = load_json(task_file)
     rows = process_rows()
     runtime = task_runtime_snapshot(task_payload, rows)
-    termination = terminate_pids(runtime["related_pids"])
+    protected_pids = self_and_ancestor_pids(rows)
+    termination = terminate_pids(runtime["related_pids"], exclude_pids=protected_pids)
     lock_path = Path(task_payload.get("session_lock", ""))
     release_session_lock(lock_path, task_file)
     task_payload["phase"] = "cancelled"
     task_payload["cancelled_at"] = now_utc()
+    task_payload["protected_pids_during_cancel"] = termination.get("excluded_pids", [])
     task_payload["stopped_related_pids"] = termination["terminated_pids"]
     task_payload["still_alive_pids_after_cancel"] = termination["still_alive_pids"]
     task_payload["watcher_exited_after_cancel"] = not bool(termination["still_alive_pids"])
@@ -833,6 +1152,7 @@ def command_cancel(args: argparse.Namespace) -> int:
             "task_id": args.task_id,
             "watcher_pid": runtime["watcher_pid"] or "none",
             "watcher_exited": not bool(termination["still_alive_pids"]),
+            "protected_pids": termination.get("excluded_pids", []),
             "stopped_related_pids": termination["terminated_pids"],
             "still_alive_pids": termination["still_alive_pids"],
         },
@@ -841,8 +1161,72 @@ def command_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def stop_single_task(task_file: Path, also_stop_target: bool) -> dict[str, Any]:
+    task_payload = load_json(task_file)
+    rows = process_rows()
+    runtime = task_runtime_snapshot(task_payload, rows)
+    protected_pids = self_and_ancestor_pids(rows)
+    termination = terminate_pids(runtime["related_pids"], exclude_pids=protected_pids)
+    lock_path = Path(task_payload.get("session_lock", ""))
+    release_session_lock(lock_path, task_file)
+
+    target_stop_result: dict[str, Any] | None = None
+    if also_stop_target:
+        target_stop_result = stop_target(task_payload["target"])
+
+    task_payload["phase"] = "cancelled"
+    task_payload["cancelled_at"] = now_utc()
+    task_payload["protected_pids_during_cancel"] = termination.get("excluded_pids", [])
+    task_payload["stopped_related_pids"] = termination["terminated_pids"]
+    task_payload["still_alive_pids_after_cancel"] = termination["still_alive_pids"]
+    task_payload["watcher_exited_after_cancel"] = not bool(termination["still_alive_pids"])
+    if target_stop_result is not None:
+        task_payload["target_stop_result"] = target_stop_result
+    write_json(task_file, task_payload)
+    return {
+        "status": "cancelled",
+        "task_id": str(task_payload.get("task_id") or ""),
+        "watcher_pid": runtime["watcher_pid"] or "none",
+        "watcher_exited": not bool(termination["still_alive_pids"]),
+        "protected_pids": termination.get("excluded_pids", []),
+        "stopped_related_pids": termination["terminated_pids"],
+        "still_alive_pids": termination["still_alive_pids"],
+        "target_stop_result": target_stop_result or "not_requested",
+    }
+
+
 def command_stop(args: argparse.Namespace) -> int:
-    return command_cancel(args)
+    state_dir = Path(args.state_dir).expanduser().resolve()
+    tasks_dir = state_dir / "tasks"
+    if args.all_active:
+        if args.task_id:
+            fatal("Use either --task-id or --all-active, not both.")
+        if not tasks_dir.exists():
+            fatal(f"State directory does not exist: {state_dir}")
+        rows = process_rows()
+        active_entries, _ = active_and_stale_task_snapshots(tasks_dir, rows)
+        stopped: list[dict[str, Any]] = []
+        for entry in active_entries:
+            task_id_value = str(entry["task_id"])
+            task_file = tasks_dir / f"{task_id_value}.json"
+            if task_file.exists():
+                stopped.append(stop_single_task(task_file, also_stop_target=args.also_stop_target))
+        emit({"status": "ok", "stopped_count": len(stopped), "stopped_tasks": stopped}, args.json)
+        return 0
+
+    if not args.task_id:
+        fatal("Either --task-id or --all-active is required.")
+    task_file = tasks_dir / f"{args.task_id}.json"
+    if not task_file.exists():
+        fatal(f"Task not found: {args.task_id}")
+    emit(stop_single_task(task_file, also_stop_target=args.also_stop_target), args.json)
+    return 0
+
+
+def command_serve(args: argparse.Namespace) -> int:
+    from wait_handoff_dashboard import command_serve as serve_dashboard
+
+    return serve_dashboard(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -889,11 +1273,42 @@ def build_parser() -> argparse.ArgumentParser:
     schedule.add_argument("--resume-prompt", help="Inline continuation instructions for the resumed session.")
     schedule.add_argument("--resume-prompt-file", help="File containing continuation instructions.")
     schedule.add_argument(
+        "--observed-log",
+        help=(
+            "Optional application/process log to show in the dashboard and resume prompt. "
+            "Use when a real incremental log already exists or is cheap and meaningful to create."
+        ),
+    )
+    schedule.add_argument(
+        "--observed-log-host",
+        help="Optional host for --observed-log. Defaults to --host for remote watched targets.",
+    )
+    schedule.add_argument("--observed-log-label", help="Human label for --observed-log in the dashboard.")
+    schedule.add_argument(
+        "--resume-retry-delay-seconds",
+        type=int,
+        default=int(os.environ.get("CODEX_WAIT_RESUME_RETRY_DELAY_SECONDS", DEFAULT_RESUME_RETRY_DELAY_SECONDS)),
+        help=(
+            "Seconds to wait before retrying `codex exec resume` after a retryable network disconnect. "
+            "Default: 1200 seconds (20 minutes)."
+        ),
+    )
+    schedule.add_argument(
+        "--resume-retry-max-attempts",
+        type=int,
+        default=int(os.environ.get("CODEX_WAIT_RESUME_RETRY_MAX_ATTEMPTS", DEFAULT_RESUME_RETRY_MAX_ATTEMPTS)),
+        help=(
+            "Maximum total `codex exec resume` attempts for retryable network disconnects. "
+            "Use 0 for unlimited retries. Default: 12."
+        ),
+    )
+    schedule.add_argument(
         "--resume-preserve-approvals-and-sandbox",
         action="store_true",
         help=(
-            "Opt out of the default full-permission resume behavior and keep the normal Codex "
-            "approval and sandbox settings when resuming."
+            "Opt out of the default no-sandbox resume behavior and keep the normal Codex "
+            "approval and sandbox settings when resuming. Not recommended for most real "
+            "blocking resumes."
         ),
     )
     schedule.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="State directory for tasks and logs.")
@@ -919,10 +1334,26 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="State directory for tasks and logs.")
     cancel.add_argument("--json", action="store_true", help="Print machine-readable JSON output.")
 
-    stop = subparsers.add_parser("stop", help="Stop a task's live watch/resume processes and mark it cancelled.")
-    stop.add_argument("--task-id", required=True, help="Task id to stop.")
+    stop = subparsers.add_parser("stop", help="Safely stop local watch/resume first, then optionally stop the watched target.")
+    stop.add_argument("--task-id", help="Task id to stop.")
+    stop.add_argument("--all-active", action="store_true", help="Stop every currently active watch/resume chain.")
+    stop.add_argument(
+        "--also-stop-target",
+        action="store_true",
+        help="After local watch/resume is down, also stop the watched target process or pattern.",
+    )
     stop.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="State directory for tasks and logs.")
     stop.add_argument("--json", action="store_true", help="Print machine-readable JSON output.")
+
+    serve = subparsers.add_parser("serve", help="Start a read-only local web dashboard for wait tasks.")
+    serve.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="State directory for tasks and logs.")
+    serve.add_argument("--host", default="127.0.0.1", help="Host interface for the local dashboard.")
+    serve.add_argument("--port", type=int, default=8765, help="Preferred dashboard port. Uses the next open port if busy.")
+    serve.add_argument("--limit", type=int, default=80, help="Number of recent tasks to show in the sidebar.")
+    serve.add_argument("--refresh-seconds", type=float, default=2.0, help="Browser auto-refresh interval.")
+    serve.add_argument("--max-log-chars", type=int, default=60000, help="Maximum tail characters to load from each text file.")
+    serve.add_argument("--open", action="store_true", help="Open the dashboard in the default browser after starting.")
+    serve.add_argument("--quiet", action="store_true", help="Suppress HTTP access logs.")
 
     return parser
 
@@ -942,6 +1373,8 @@ def main() -> int:
         return command_cancel(args)
     if args.command == "stop":
         return command_stop(args)
+    if args.command == "serve":
+        return command_serve(args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 

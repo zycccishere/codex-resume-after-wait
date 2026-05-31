@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script="${CODEX_WAIT_HANDOFF_SCRIPT:-$HOME/.codex/skills/blocking-wait-handoff/scripts/codex_wait_handoff.py}"
+
+if [[ $# -gt 0 ]]; then
+  exec python3 "$script" serve "$@"
+fi
+
+if [[ -d "$PWD/tmp/codex-wait-handoff/tasks" ]]; then
+  state_dir="$PWD/tmp/codex-wait-handoff"
+elif [[ -d "$HOME/Desktop/WorkHub/tmp/codex-wait-handoff/tasks" ]]; then
+  state_dir="$HOME/Desktop/WorkHub/tmp/codex-wait-handoff"
+else
+  state_dir="$HOME/.codex/skills/blocking-wait-handoff/tmp/codex-wait-handoff"
+fi
+
+exec python3 "$script" serve \
+  --state-dir "$state_dir" \
+  --port "${CODEX_WAIT_HANDOFF_DASHBOARD_PORT:-8765}" \
+  --open

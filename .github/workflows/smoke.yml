@@ -16,3 +16,10 @@ jobs:
         run: python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py --help
       - name: Status help
         run: python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py status --help
+      - name: Serve help
+        run: python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py serve --help
+      - name: Compile scripts
+        run: |
+          python3 -m py_compile \
+            skills/blocking-wait-handoff/scripts/codex_wait_handoff.py \
+            skills/blocking-wait-handoff/scripts/wait_handoff_dashboard.py
