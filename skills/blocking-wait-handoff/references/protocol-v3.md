@@ -603,7 +603,8 @@ Never infer migration from the same `thread_id` appearing on another host.
 | Explicit Unix without ancestor proof | Marker by default; weak native with explicit opt-in | Conditional on a currently connected and subscribed first-party client; instance continuity is not guaranteed |
 | Explicit remote WebSocket or `wss://` connect alias for a `ws://` listener | Marker by default; weak native with credential reference and explicit opt-in; proxy/restart backend is not fenced | Conditional on a currently connected and subscribed first-party client |
 | Desktop controlling a Terminal host | Subscriber surface; watcher attaches to the Terminal host authority | First-party relay streams only while Desktop is connected and task-subscribed |
-| Typical Desktop SSH remote project using a private app-server/proxy | Marker only | No supported watcher attachment to that private topology |
+| Desktop SSH remote project using `app-server --listen unix://` and `app-server proxy` | Strong native when the remote watcher proves the exact ancestor Unix listener, socket inode, and live process incarnation | Desktop receives the normal stream through its existing SSH proxy |
+| Older/custom Desktop SSH topology with only private stdio | Marker only | No supported watcher attachment to that private topology |
 | Terminal Embedded | Marker only | No external endpoint |
 | Desktop/IDE private stdio | Marker only | Private pipes are not a supported second-client endpoint |
 

@@ -294,8 +294,12 @@ instead of attaching the watcher as their handler.
   after explicit `--allow-weak-authority` and with the exact connect endpoint and credential
   reference. Preserve a distinct ancestor listener endpoint for `ws://` to `wss://` aliases; the
   alias remains weak and has no app-server-instance fence.
-- Treat the typical Desktop SSH private app-server/proxy topology as marker-only. Do not infer an
-  attachable endpoint merely because the Desktop can stream from its own private connection.
+- For Desktop SSH projects, inspect the process ancestry on the SSH host. The audited Desktop
+  implementation starts `app-server --listen unix://` there and reaches it through
+  `app-server proxy`; when the watcher is a descendant of that listener and proves its exact Unix
+  socket inode plus process incarnation, use strong native delivery. Treat older or customized
+  private-stdio SSH topologies as marker-only. Never infer an attachable endpoint merely because
+  Desktop can stream.
 - Use marker only, unconditionally, for Embedded or private stdio owners.
 - Never infer common authority from a shared `thread_id` or rollout directory.
 

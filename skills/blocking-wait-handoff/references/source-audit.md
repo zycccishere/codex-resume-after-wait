@@ -285,14 +285,18 @@ The 2026-07-30 runtime inspection found several simultaneous authorities:
 
 - the managed Terminal daemon on its Unix socket;
 - local Desktop and Cursor/IDE app-servers using distinct private stdio processes;
-- a Desktop SSH project using a remote app-server/proxy; and
+- a Desktop SSH project using a remote Unix-listening app-server reached through an SSH
+  `app-server proxy`; and
 - a separate remote IDE app-server.
 
 These are observations of one environment, not universal product defaults. They demonstrate why
 surface name and common rollout storage cannot establish authority. The protocol probes the exact
-endpoint on every native attempt. In particular, the observed Desktop SSH app-server/proxy was a
-private topology with no supported second-client attachment, so the skill treats that default case
-as marker-only.
+endpoint on every native attempt. Reinspection of the installed Desktop build showed that its SSH
+transport starts `codex app-server --listen unix://` on the remote host, then runs
+`codex app-server proxy` over SSH. A watcher launched inside that remote task can attach locally to
+the same Unix listener and qualifies as strong only after proving ancestor provenance, socket
+device/inode, and the app-server process incarnation. An older or customized SSH transport that
+exposes only private stdio remains marker-only.
 
 ## Remaining product boundary
 

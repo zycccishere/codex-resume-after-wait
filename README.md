@@ -237,7 +237,8 @@ claim, but remains periodic polling and does not turn marker delivery into a nat
 | Explicit/configured Unix endpoint without ancestor provenance | Marker by default; weak native only with explicit opt-in | Conditional on a currently connected and subscribed first-party client |
 | Explicit remote WebSocket or a `wss://` connect alias for a `ws://` listener | Marker by default; weak native only with credential reference and `--allow-weak-authority`; no backend-instance fence | Conditional on a currently connected and subscribed first-party client |
 | Desktop or another Remote Control client controlling the Terminal host | Subscriber surface, not a distinct delivery authority | Streams only while connected and subscribed to the task |
-| Typical Desktop SSH remote project with a private app-server/proxy | Marker only | No supported watcher attachment to that private topology |
+| Desktop SSH remote project using `app-server --listen unix://` plus `app-server proxy` | Strong native when the watcher runs on that remote host and proves the exact ancestor socket, inode, and process incarnation | Desktop receives the normal stream through its existing SSH proxy |
+| Older/custom Desktop SSH topology whose remote owner exposes only private stdio | Marker only | No supported watcher attachment to that private topology |
 | Terminal Embedded | Marker only | No external attachment endpoint |
 | Desktop or IDE private stdio | Marker only | The private pipes are not a supported second-client endpoint |
 
@@ -251,6 +252,11 @@ requires the host to remain awake and online, the account signed in, and the hos
 those conditions are absent, no live stream is promised. Accepted input and output remain in
 persisted task history, and an approval may remain pending until a first-party client later resumes
 and subscribes.
+
+The audited Desktop SSH implementation starts a Unix-listening app-server on the SSH host and
+connects Desktop through `codex app-server proxy`. A watcher launched by that remote task runs on
+the same host and can therefore attach to the same Unix socket. This is different from local
+Desktop project and projectless tasks, whose owner is still the app's private stdio app-server.
 
 ## Cancellation, recovery, and handoff
 

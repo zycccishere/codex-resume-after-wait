@@ -178,6 +178,51 @@ class AuthorityStrengthTests(unittest.TestCase):
         self.assertIs(task["authority"]["weak_authority_accepted"], False)
         self.assertNotIn("command", task["authority"]["owner_process_identity"])
 
+    def test_desktop_ssh_unix_listener_is_discovered_as_attachable(self) -> None:
+        app_server_pid = 4242
+        app_server_identity = handoff.ProcessIdentity(
+            scope="local",
+            pid=app_server_pid,
+            ppid=1,
+            state="S",
+            source="linux-proc-starttime",
+            start_token="123456",
+            command="codex app-server",
+        )
+        rows = [
+            {
+                "pid": os.getpid(),
+                "ppid": app_server_pid,
+                "command": "python3 codex_wait_handoff.py doctor",
+            },
+            {
+                "pid": app_server_pid,
+                "ppid": 1,
+                "command": (
+                    "codex -c features.code_mode_host=true app-server "
+                    "--listen unix://"
+                ),
+            },
+        ]
+        with (
+            mock.patch.object(handoff, "process_rows", return_value=rows),
+            mock.patch.object(
+                handoff,
+                "capture_local_identity",
+                return_value=app_server_identity,
+            ),
+        ):
+            context = handoff.ancestor_app_server_context()
+
+        self.assertEqual(context["source"], "ancestor-listener")
+        self.assertIs(context["attachable"], True)
+        self.assertEqual(context["endpoint"], "unix://")
+        self.assertEqual(context["app_server_pid"], app_server_pid)
+        self.assertEqual(
+            context["owning_app_server_identity"],
+            handoff.durable_authority_process_identity(app_server_identity),
+        )
+
     def test_strong_requires_attachable_non_diagnostic_context(self) -> None:
         identity = handoff.capture_local_identity(os.getpid())
         endpoint = "unix:///tmp/codex-owner.sock"
