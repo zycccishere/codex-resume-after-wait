@@ -115,9 +115,12 @@ class ProcessIdentityTests(unittest.TestCase):
     def test_pid_reuse_is_dead_for_original_and_never_signaled(self) -> None:
         expected = self.identity(token="boot:old")
         replacement = self.identity(token="boot:new")
+        pidfd_open = mock.Mock(side_effect=ProcessLookupError)
         with (
             mock.patch.object(process, "capture_local_identity", return_value=replacement),
             mock.patch.object(process.os, "kill") as kill,
+            mock.patch.object(process.os, "pidfd_open", pidfd_open, create=True),
+            mock.patch.object(process.signal, "pidfd_send_signal", mock.Mock(), create=True),
         ):
             probe = process.probe_local_identity(expected)
             result = process.terminate_local_identity(expected, grace_seconds=0)
@@ -127,6 +130,7 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertEqual(result["reason"], "pid_reused")
         self.assertEqual(result["signals_sent"], [])
         kill.assert_not_called()
+        pidfd_open.assert_not_called()
 
     def test_local_pattern_excludes_helper_and_all_ancestors(self) -> None:
         target = self.identity(pid=9000)

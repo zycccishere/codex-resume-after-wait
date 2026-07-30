@@ -510,6 +510,16 @@ def terminate_local_identity(
     if identity.scope != "local":
         raise ValueError("terminate_local_identity requires a local identity")
     signals_sent: list[str] = []
+    # Classify a replacement before opening a Linux pidfd.  Besides making the
+    # result independent of pidfd availability, this preserves ``pid_reused``
+    # if the replacement exits between this probe and pidfd_open().  Every
+    # signal path still revalidates after this point to fence that race.
+    initial_probe = probe_local_identity(identity)
+    if initial_probe.status != "alive":
+        status = "probe_failed" if initial_probe.status == "unknown" else "original_exited"
+        detail = initial_probe.detail if initial_probe.status == "unknown" else initial_probe.reason
+        return _termination_result(identity, status, detail, signals_sent)
+
     pidfd: int | None = None
     pidfd_sender = getattr(signal, "pidfd_send_signal", None)
     pidfd_open = getattr(os, "pidfd_open", None)
