@@ -7,13 +7,8 @@ if [[ $# -gt 0 ]]; then
   exec python3 "$script" serve "$@"
 fi
 
-if [[ -d "$PWD/tmp/codex-wait-handoff/tasks" ]]; then
-  state_dir="$PWD/tmp/codex-wait-handoff"
-elif [[ -d "$HOME/Desktop/WorkHub/tmp/codex-wait-handoff/tasks" ]]; then
-  state_dir="$HOME/Desktop/WorkHub/tmp/codex-wait-handoff"
-else
-  state_dir="$HOME/.codex/skills/blocking-wait-handoff/tmp/codex-wait-handoff"
-fi
+codex_data_dir="${CODEX_HOME:-$HOME/.codex}"
+state_dir="${CODEX_WAIT_STATE_DIR:-$codex_data_dir/wait-handoff}"
 
 exec python3 "$script" serve \
   --state-dir "$state_dir" \

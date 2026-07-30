@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
-import os
 import re
-import shutil
 import shlex
+import shutil
 import subprocess
 import sys
-import time
 import webbrowser
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -18,16 +17,48 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from process_identity import (
+    ProcessIdentity,
+    ProcessIdentityError,
+    probe_local_identity,
+    validate_remote_host,
+)
+
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
-ACTIVE_PHASES = {"scheduled", "watching", "resume_started", "resume_retry_waiting"}
-ERROR_PHASES = {"resume_failed"}
-WARNING_PHASES = {"max_wait_reached", "cancelled", "resume_retry_waiting"}
-SUCCESS_PHASES = {"resume_ok", "resume_dry_run_complete"}
+ACTIVE_PHASES = {
+    "reserving",
+    "registration_recovery_required",
+    "scheduled",
+    "watching",
+    "event_staged",
+    "native_message_ready",
+    "native_message_queued",
+    "native_message_submitting",
+    "native_message_submitted",
+    "native_message_deferred",
+    "marker_claiming",
+}
+ERROR_PHASES = {
+    "marker_blocked",
+    "native_message_blocked",
+    "registration_blocked",
+    "resume_failed",
+    "schedule_failed",
+}
+WARNING_PHASES = {
+    "marker_pending",
+    "marker_unknown",
+    "cancelled",
+    "native_message_unknown",
+}
+SUCCESS_PHASES = {
+    "native_message_accepted",
+    "marker_claimed",
+    "resume_dry_run_complete",
+}
 TEXT_FILE_FIELDS = {
     "watch_log": "log_file",
-    "resume_log": "resume_log_file",
-    "last_message": "last_message_file",
     "prompt": "prompt_file",
 }
 OPEN_FILE_KINDS = set(TEXT_FILE_FIELDS) | {"observed_log", "raw", "task"}
@@ -121,10 +152,8 @@ INDEX_HTML = r"""<!doctype html>
 
         <section class="tabs-panel">
           <div class="tabs" role="tablist" aria-label="Task files">
-            <button class="tab active" data-tab="last_message" type="button">Answer</button>
+            <button class="tab active" data-tab="watch_log" type="button">Watch Log</button>
             <button class="tab" data-tab="observed_log" type="button">Observed Log</button>
-            <button class="tab" data-tab="watch_log" type="button">Watch Log</button>
-            <button class="tab" data-tab="resume_log" type="button">Resume Log</button>
             <button class="tab" data-tab="prompt" type="button">Prompt</button>
             <button class="tab" data-tab="raw" type="button">JSON</button>
           </div>
@@ -759,7 +788,7 @@ APP_JS = r"""const state = {
   tasks: [],
   selectedTaskId: null,
   selectedTask: null,
-  selectedTab: "last_message",
+  selectedTab: "watch_log",
   refreshSeconds: 2,
   search: "",
 };
@@ -776,10 +805,10 @@ function escapeHtml(value) {
 }
 
 function phaseClass(phase) {
-  if (["resume_ok", "resume_dry_run_complete"].includes(phase)) return "phase-ok";
-  if (["scheduled", "watching", "resume_started", "resume_retry_waiting"].includes(phase)) return "phase-active";
-  if (["max_wait_reached", "cancelled"].includes(phase)) return "phase-warn";
-  if (phase === "resume_failed") return "phase-bad";
+  if (["native_message_accepted", "marker_claimed", "resume_dry_run_complete"].includes(phase)) return "phase-ok";
+  if (["reserving", "registration_recovery_required", "scheduled", "watching", "event_staged", "native_message_ready", "native_message_queued", "native_message_submitting", "native_message_submitted", "native_message_deferred", "marker_claiming"].includes(phase)) return "phase-active";
+  if (["marker_pending", "marker_unknown", "cancelled", "native_message_unknown"].includes(phase)) return "phase-warn";
+  if (["marker_blocked", "native_message_blocked", "registration_blocked", "resume_failed", "schedule_failed"].includes(phase)) return "phase-bad";
   return "phase-default";
 }
 
@@ -1038,7 +1067,7 @@ async function openTaskFile() {
 async function killSelectedTask() {
   if (!state.selectedTaskId || !state.selectedTask) return;
   const taskId = state.selectedTaskId;
-  const ok = window.confirm(`Kill the local watch/resume handoff for ${taskId}? This does not stop the watched target process.`);
+  const ok = window.confirm(`Stop the exact watcher for ${taskId}? This does not stop the watched target process.`);
   if (!ok) return;
   const button = $("killTaskButton");
   button.disabled = true;
@@ -1199,6 +1228,11 @@ def read_observed_log(task: dict[str, Any], max_chars: int) -> dict[str, Any]:
     if not host:
         metadata["text"] = "Remote observed log is missing a host."
         return metadata
+    try:
+        host = validate_remote_host(host)
+    except ProcessIdentityError as exc:
+        metadata["text"] = f"Unsafe remote observed-log host: {exc}"
+        return metadata
     command = (
         f"path={shlex.quote(path)}; "
         f"if [ ! -e \"$path\" ]; then echo __CODEX_LOG_MISSING__; exit 4; fi; "
@@ -1207,7 +1241,16 @@ def read_observed_log(task: dict[str, Any], max_chars: int) -> dict[str, Any]:
     )
     try:
         result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, command],
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "--",
+                host,
+                command,
+            ],
             capture_output=True,
             text=True,
             timeout=10,
@@ -1337,15 +1380,23 @@ def elapsed_seconds(task: dict[str, Any], generated_at: datetime) -> int | None:
 
 def derive_task(task: dict[str, Any], rows: list[dict[str, Any]], state_dir: Path, generated_at: datetime) -> dict[str, Any]:
     task_id_value = str(task.get("task_id") or "")
-    row_by_pid = {int(row["pid"]): row for row in rows}
     watcher_pid = int(task.get("watcher_pid") or 0)
-    watcher_alive = bool(watcher_pid and watcher_pid in row_by_pid)
-    resume_pids = [
-        int(row["pid"])
-        for row in rows
-        if task_id_value and task_id_value in str(row.get("command") or "") and "codex exec resume" in str(row.get("command") or "")
-    ]
-    related_pids = sorted(set(([watcher_pid] if watcher_alive else []) + resume_pids))
+    watcher_alive = False
+    watcher_identity_status = "missing"
+    raw_watcher_identity = task.get("watcher_identity")
+    if isinstance(raw_watcher_identity, dict):
+        try:
+            watcher_identity = ProcessIdentity.from_dict(raw_watcher_identity)
+            if watcher_identity.pid != watcher_pid:
+                raise ProcessIdentityError(
+                    "watcher_identity does not match watcher_pid"
+                )
+            probe = probe_local_identity(watcher_identity)
+            watcher_identity_status = probe.status
+            watcher_alive = probe.status == "alive"
+        except (KeyError, TypeError, ValueError, ProcessIdentityError) as error:
+            watcher_identity_status = f"invalid: {error}"
+    related_pids = [watcher_pid] if watcher_alive else []
     phase = str(task.get("phase") or "unknown")
     elapsed = elapsed_seconds(task, generated_at)
     max_wait = int(task.get("max_wait_seconds") or 0)
@@ -1354,7 +1405,7 @@ def derive_task(task: dict[str, Any], rows: list[dict[str, Any]], state_dir: Pat
         ratio = min(max(elapsed / max_wait, 0.0), 1.0)
     elif phase in SUCCESS_PHASES:
         ratio = 1.0
-    process_live = bool(watcher_alive or resume_pids)
+    process_live = watcher_alive
     return {
         "task_id": task_id_value,
         "phase": phase,
@@ -1365,7 +1416,7 @@ def derive_task(task: dict[str, Any], rows: list[dict[str, Any]], state_dir: Pat
         "state_dir": str(state_dir),
         "watcher_pid": watcher_pid or None,
         "watcher_alive": watcher_alive,
-        "resume_pids": sorted(resume_pids),
+        "watcher_identity_status": watcher_identity_status,
         "related_pids": related_pids,
         "process_live": process_live,
         "stoppable": bool(process_live or phase in ACTIVE_PHASES),
@@ -1721,6 +1772,17 @@ def bind_server(host: str, port: int, config: dict[str, Any]) -> DashboardServer
 
 def command_serve(args: Any) -> int:
     state_dir = Path(args.state_dir).expanduser().resolve()
+    dashboard_host = str(args.host)
+    if dashboard_host.lower() != "localhost":
+        try:
+            is_loopback = ipaddress.ip_address(dashboard_host).is_loopback
+        except ValueError:
+            is_loopback = False
+        if not is_loopback:
+            raise SystemExit(
+                "Dashboard contains task control and log data; --host must be a literal "
+                "loopback address or localhost."
+            )
     config = {
         "state_dir": str(state_dir),
         "limit": max(int(args.limit), 1),
@@ -1728,7 +1790,7 @@ def command_serve(args: Any) -> int:
         "max_log_chars": max(int(args.max_log_chars), 1000),
         "quiet": bool(args.quiet),
     }
-    server = bind_server(str(args.host), int(args.port), config)
+    server = bind_server(dashboard_host, int(args.port), config)
     actual_host, actual_port = server.server_address[:2]
     display_host = "127.0.0.1" if actual_host in {"", "0.0.0.0"} else actual_host
     url = f"http://{display_host}:{actual_port}/"
