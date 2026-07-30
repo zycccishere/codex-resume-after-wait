@@ -588,6 +588,7 @@ class AppServerClient:
 
     def loaded_thread_ids(self) -> set[str]:
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         loaded: set[str] = set()
         while True:
             params = {"cursor": cursor} if cursor else {}
@@ -601,9 +602,19 @@ class AppServerClient:
                         "thread/loaded/list returned a non-string thread id"
                     )
                 loaded.add(thread_id)
-            cursor = result.get("nextCursor")
-            if not cursor:
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
                 return loaded
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise AppServerError(
+                    "thread/loaded/list returned an invalid nextCursor"
+                )
+            if next_cursor in seen_cursors:
+                raise AppServerError(
+                    "thread/loaded/list returned a repeated nextCursor"
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
 
     def read_thread(self, thread_id: str, include_turns: bool = True) -> dict[str, Any]:
         result = self.request(

@@ -32,12 +32,36 @@ owner is still loaded. A strong ticket additionally proves the exact local Unix 
 app-server incarnation; a weak ticket proves only the selected endpoint descriptor and accepts
 restart, endpoint-reuse, or proxy-backend ambiguity. It then reads the current task state:
 
+### Delivery decision matrix
+
+Actor routing and app-server attachment are separate decisions. `schedule` and `doctor` use the
+same named `delivery_branch`; there is no implicit fallthrough between these rows.
+
+| Verified actor route | Owner authority at scheduling | `auto` | Explicit `native-message` |
+| --- | --- | --- | --- |
+| No | Any | Reject | Reject |
+| Yes | Private stdio or Embedded; no attachable endpoint | Marker | Reject |
+| Yes | Attachable, but exact owner is not positively loaded | Marker | Reject |
+| Yes | Loaded behind exact ancestor Unix listener + inode + live process | Strong native | Strong native |
+| Yes | Loaded behind WS/WSS, alias, or non-ancestor endpoint | Marker | Reject unless `--allow-weak-authority`; then weak native |
+
+Explicit `marker` is accepted only with a verified actor route. A marker never wakes an idle task.
+The actor branch is independent: durable tasks and ordinary forks own themselves, nested
+subagents route to their verified durable agent-tree root, and `/side` or incomplete ancestry is
+rejected. Ordinary forks share the earliest verified fork-lineage job scope, so only the first
+branch can reserve one logical job/process incarnation.
+
 | Owner state | Submission | Positive acceptance evidence |
 | --- | --- | --- |
 | One regular turn is active | `turn/steer` with its exact `expectedTurnId` | Successful response for that exact turn |
 | No turn is active on a positively loaded owner | `turn/start` | The matching `userMessage.clientId` appears in the owner's persisted history |
-| Review/compact or a read/submit collision | No accepted input | Keep the same FIFO position, re-read, and retry after the explicit rejection |
+| Review/compact or a read/submit collision | No accepted input | Keep the same FIFO position and retry after the explicit rejection, bounded separately (900 one-second retries by default) |
 | State is ambiguous | Nothing is guessed | Fail closed before submission |
+
+The collision count is durable across watcher recovery. Override it with
+`--state-collision-max-attempts`; use `0` only when an intentionally unlimited non-steerable wait
+is acceptable. Exhaustion is a definitive pre-submission `BLOCKED`, so the job can be scheduled
+again later without risking a duplicate accepted message.
 
 Every submission carries a unique `clientUserMessageId`. It is acceptance evidence, not a
 documented server-side idempotency key. Once request bytes may have crossed the transport boundary,
@@ -80,10 +104,12 @@ python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py schedule \
   --note "Inspect the outputs and continue the blocked task."
 ```
 
-The default endpoint is the managed daemon socket under
-`$CODEX_HOME/app-server-control/app-server-control.sock`. For a TUI using an explicit remote
-app-server, supply the exact same client connect endpoint; Codex does not export it to child
-shells reliably:
+When the current shell descends from an attachable app-server listener, the script uses that exact
+ancestor endpoint. Otherwise it uses the managed daemon socket under
+`$CODEX_HOME/app-server-control/app-server-control.sock` only for persisted routing diagnostics;
+that socket never becomes the owner of a private Desktop/IDE or Embedded task. For a TUI using an
+explicit remote app-server, supply the exact same client connect endpoint if discovery cannot
+recover it reliably:
 
 ```bash
 export CODEX_WAIT_REMOTE_TOKEN='<bearer token>'
@@ -111,7 +137,7 @@ Read the schedule result and its linked task record before ending the current tu
 - `task_id`, `event_id`, and `client_user_message_id`;
 - `actor_thread_id`, `owner_thread_id`, and `owner_route`;
 - `job_scope_id`, `logical_job_id`, and `job_key`;
-- `resume_protocol`, `authority`, `authority_strength`, and `fifo_generation`; and
+- `resume_protocol`, `delivery_branch`, `authority`, `authority_strength`, and `fifo_generation`; and
 - `will_wake_idle_thread`, `native_at_most_once`, and `strict_exactly_once`.
 
 Only `resume_protocol=native-message` can wake an idle task. `marker` requires a later owner-side

@@ -664,6 +664,82 @@ class NativeMessageDeliveryTests(unittest.TestCase):
                 self.assertEqual(entry["state"], "ACCEPTED")
                 self.assertEqual(len(entry["submission_deferrals"]), 1)
 
+    def test_state_collision_budget_is_finite_and_survives_restart(self) -> None:
+        class SimulatedRestart(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            task_file, task, ledger = self.make_ready_task(
+                Path(temp),
+                retry_max_attempts=1,
+            )
+            task["state_collision_max_attempts"] = 2
+            handoff.write_json(task_file, task)
+            first_process = FakeAppServerClient(
+                ["review_turn"],
+                thread_status_type="active",
+                active_turn_id="review-turn",
+            )
+            with (
+                mock.patch.object(
+                    handoff,
+                    "AppServerClient",
+                    return_value=first_process,
+                ),
+                mock.patch.object(
+                    handoff.time,
+                    "sleep",
+                    side_effect=SimulatedRestart("watcher restarted"),
+                ),
+                self.assertRaises(SimulatedRestart),
+            ):
+                handoff.dispatch_native_message(
+                    task_file,
+                    task,
+                    "wait for review to finish",
+                )
+
+            after_restart = ledger.validate("task-1", "token-1", 1)
+            self.assertEqual(after_restart["state"], "READY")
+            self.assertEqual(
+                [
+                    row["classification"]
+                    for row in after_restart["submission_deferrals"]
+                ],
+                ["state_collision"],
+            )
+
+            replacement = FakeAppServerClient(
+                ["review_turn", "accepted"],
+                thread_status_type="active",
+                active_turn_id="review-turn",
+            )
+            with (
+                mock.patch.object(
+                    handoff,
+                    "AppServerClient",
+                    return_value=replacement,
+                ),
+                mock.patch.object(handoff.time, "sleep") as sleep,
+            ):
+                result = handoff.dispatch_native_message(
+                    task_file,
+                    handoff.load_json(task_file),
+                    "wait for review to finish",
+                )
+
+            self.assertEqual(result, 4)
+            self.assertEqual(len(replacement.turn_steer_calls), 1)
+            self.assertEqual(replacement.outcomes, ["accepted"])
+            sleep.assert_not_called()
+            terminal = ledger.validate("task-1", "token-1", 1)
+            self.assertEqual(terminal["state"], "BLOCKED")
+            self.assertTrue(terminal["blocked_without_submission"])
+            self.assertEqual(
+                handoff.load_json(task_file)["delivery_status"],
+                "state_collision_retries_exhausted",
+            )
+
     def test_input_too_large_is_immediately_blocked_without_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             task_file, task, ledger = self.make_ready_task(
@@ -1536,6 +1612,7 @@ class NativeMessageDeliveryTests(unittest.TestCase):
             task_file = next((state_dir / "tasks").glob("*.json"))
             task = handoff.load_json(task_file)
             self.assertEqual(task["resume_protocol"], "marker")
+            self.assertEqual(task["delivery_branch"], "marker-owner-not-ready")
             self.assertEqual(
                 task["protocol_fallback_reason"],
                 "private stdio authority is not attachable",

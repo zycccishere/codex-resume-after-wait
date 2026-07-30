@@ -39,10 +39,26 @@ Reject every unverified actor-to-owner route, including marker delivery. Without
 `forkedFromId` and `parentThreadId` ancestry, separate branches could create separate job
 registries and trigger the same logical completion more than once.
 
+Use the `delivery_branch` emitted by both `doctor` and `schedule`. Apply this matrix without an
+implicit fallback:
+
+| Route and owner authority | `auto` | Explicit native |
+| --- | --- | --- |
+| Route unverified | Reject | Reject |
+| Verified, private stdio or Embedded | Marker | Reject |
+| Verified, attachable but owner not loaded | Marker | Reject |
+| Verified, loaded, exact ancestor Unix + inode + live process | Strong native | Strong native |
+| Verified, loaded, WS/WSS, alias, or non-ancestor endpoint | Marker | Reject unless weak authority is explicitly accepted |
+
+Allow explicit marker only after route verification. Remember that marker is a manual owner-side
+claim and never wakes an idle task.
+
 ## Bind the authority
 
-Use the managed daemon Unix socket by default. For an explicit remote TUI or another listener,
-pass the exact endpoint to both `doctor` and `schedule`:
+Use an attachable ancestor listener when discovery proves one. Otherwise use the managed daemon
+Unix socket only to read persisted routing metadata; never promote it into the owner of a private
+Desktop/IDE or Embedded task. For an explicit remote TUI or another listener, pass the exact
+endpoint to both `doctor` and `schedule`:
 
 ```bash
 --app-server-endpoint 'unix:///absolute/path/app-server.sock'
@@ -176,7 +192,7 @@ Read and report:
 - `task_id`, `event_id`, and `client_user_message_id`;
 - `actor_thread_id`, `owner_thread_id`, `owner_route`, and `job_scope_id`;
 - `logical_job_id`, `job_key`, and `job_reservation_generation` when present;
-- `resume_protocol`, `authority`, `authority_strength`, and `fifo_generation`;
+- `resume_protocol`, `delivery_branch`, `authority`, `authority_strength`, and `fifo_generation`;
 - `will_wake_idle_thread`, `native_at_most_once`, and `strict_exactly_once`; and
 - `protocol_fallback_reason`.
 
@@ -228,8 +244,10 @@ use experimental `thread/turns/list` instead.
   notifications on the watcher's fresh, unsubscribed connection.
 - For an active state without exactly one in-progress turn, submit nothing and fail closed.
 - On an explicit no-active/mismatched-turn or Review/Compact rejection, return the event to `READY`
-  with its original sequence, re-read state, and retry. Do not consume the general retry budget for
-  this state collision.
+  with its original sequence, re-read state, and retry. Use the separate durable state-collision
+  budget (900 one-second retries by default); do not consume the general authority retry budget.
+  Let exhaustion become pre-submission `BLOCKED`. Use `--state-collision-max-attempts 0` only for
+  an intentional unlimited wait.
 - On a permanent input rejection, terminate as `BLOCKED`.
 - Once a request may have started, convert every timeout, disconnect, lost response, or failed
   post-`turn/start` history read to `UNKNOWN`. Never resend automatically.

@@ -293,6 +293,35 @@ class FakeWebSocketAppServer:
 
 
 class AppServerEndpointTests(unittest.TestCase):
+    def test_loaded_thread_list_rejects_a_repeated_cursor(self) -> None:
+        client = app_server.AppServerClient("ws://127.0.0.1:43210/rpc")
+        with mock.patch.object(
+            client,
+            "request",
+            side_effect=(
+                {"data": ["thread-a"], "nextCursor": "cursor-a"},
+                {"data": ["thread-b"], "nextCursor": "cursor-a"},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                app_server.AppServerError,
+                "repeated nextCursor",
+            ):
+                client.loaded_thread_ids()
+
+    def test_loaded_thread_list_rejects_an_invalid_cursor(self) -> None:
+        client = app_server.AppServerClient("ws://127.0.0.1:43210/rpc")
+        with mock.patch.object(
+            client,
+            "request",
+            return_value={"data": ["thread-a"], "nextCursor": ""},
+        ):
+            with self.assertRaisesRegex(
+                app_server.AppServerError,
+                "invalid nextCursor",
+            ):
+                client.loaded_thread_ids()
+
     def test_endpoint_uri_parsing(self) -> None:
         unix = app_server.parse_app_server_endpoint(Path("relative.sock"))
         self.assertEqual(unix.transport, "unix")

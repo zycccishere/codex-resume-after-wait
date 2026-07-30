@@ -189,6 +189,22 @@ not expose the app-server directly to the public Internet. A mismatched Unix end
 same rule and cannot inherit the ancestor's strong provenance. Private stdio and Embedded contexts
 remain non-attachable instead of being converted into aliases.
 
+### Protocol selection matrix
+
+`schedule` and `doctor` call the same pure classifier and expose its stable `delivery_branch`.
+Actor routing is decided first; authority selection cannot repair an unverified route.
+
+| Verified route | Owner attachment state | Authority strength | `auto` | Explicit native |
+| --- | --- | --- | --- | --- |
+| No | Any | Any | Reject | Reject |
+| Yes | Private stdio or Embedded | None | Marker | Reject |
+| Yes | Attachable but owner not positively loaded | Any | Marker | Reject |
+| Yes | Loaded | Strong | Native | Native |
+| Yes | Loaded | Weak | Marker | Native only with durable explicit opt-in |
+
+Explicit marker bypasses authority probing but never route verification. The classifier has no
+cold-load, second-owner, native-to-marker-after-request, or unclassified-authority fallthrough.
+
 ## Durable coordination layers
 
 ### Protocol ledgers
@@ -382,6 +398,9 @@ If the active snapshot is ambiguous, the dispatcher submits nothing. If the stat
 read and RPC, `NoActiveTurn`, expected-turn mismatch, or Review/Compact non-steerable errors are
 explicit non-acceptance. The event returns to its same sequence, state is re-read after a short
 collision delay, and this collision does not consume the general authority/error retry budget.
+It consumes a separate persisted collision budget: 900 one-second retries by default. Exhaustion
+atomically becomes pre-submission `BLOCKED`, which cannot duplicate input and releases the common
+job key for a later deliberate retry. `0` enables an intentionally unlimited collision wait.
 
 ### Idle owner: `turn/start` plus persisted-history ACK
 

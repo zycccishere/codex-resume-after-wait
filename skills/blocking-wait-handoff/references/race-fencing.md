@@ -142,7 +142,8 @@ the same event.
 - Write and fsync the final prompt plus digest before publishing `event_staged` and before assigning
   `READY`.
 - Recover `event_staged` or ledger `READY` in place; never return it to process observation.
-- Preserve the original maximum-wait deadline and ledger deferral budget across restart.
+- Preserve the original maximum-wait deadline, general deferral budget, and separate finite
+  state-collision budget across restart.
 
 ### Regression coverage
 
@@ -151,6 +152,7 @@ the same event.
 - `RaceFencingTests.test_event_staged_never_exposes_an_initial_placeholder_prompt`
 - `CrashRecoveryTests.test_restarted_watcher_preserves_original_max_wait_deadline`
 - `NativeMessageDeliveryTests.test_restart_preserves_submission_deferral_retry_budget`
+- `NativeMessageDeliveryTests.test_state_collision_budget_is_finite_and_survives_restart`
 - `NativeMessageDeliveryTests.test_timeout_after_request_is_unknown_and_replay_never_resends`
 
 ## Cross-layer monotonicity

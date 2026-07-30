@@ -174,6 +174,7 @@ class AuthorityStrengthTests(unittest.TestCase):
                 Path(temp), context=context, authority=authority
             )
         self.assertEqual(task["resume_protocol"], "native-message")
+        self.assertEqual(task["delivery_branch"], "native-strong-authority")
         self.assertEqual(task["authority"]["authority_strength"], "strong")
         self.assertIs(task["authority"]["weak_authority_accepted"], False)
         self.assertNotIn("command", task["authority"]["owner_process_identity"])
@@ -221,6 +222,31 @@ class AuthorityStrengthTests(unittest.TestCase):
         self.assertEqual(
             context["owning_app_server_identity"],
             handoff.durable_authority_process_identity(app_server_identity),
+        )
+
+    def test_arbitrary_ancestor_app_server_argument_is_not_an_authority(self) -> None:
+        helper_pid = 4242
+        rows = [
+            {
+                "pid": os.getpid(),
+                "ppid": helper_pid,
+                "command": "python3 codex_wait_handoff.py doctor",
+            },
+            {
+                "pid": helper_pid,
+                "ppid": 1,
+                "command": "python3 helper.py app-server --listen unix:///tmp/wrong.sock",
+            },
+        ]
+        with mock.patch.object(handoff, "process_rows", return_value=rows):
+            context = handoff.ancestor_app_server_context()
+
+        self.assertEqual(context, {"source": "undiscovered", "attachable": None})
+
+    def test_node_codex_launcher_is_recognized(self) -> None:
+        self.assertTrue(handoff.is_codex_launcher_token("/opt/codex/codex.js"))
+        self.assertFalse(
+            handoff.is_codex_launcher_token("/tmp/codex-wait-handoff.py")
         )
 
     def test_strong_requires_attachable_non_diagnostic_context(self) -> None:
@@ -329,6 +355,7 @@ class AuthorityStrengthTests(unittest.TestCase):
                 Path(temp), context=context, authority=NETWORK_AUTHORITY
             )
         self.assertEqual(marker["resume_protocol"], "marker")
+        self.assertEqual(marker["delivery_branch"], "marker-weak-authority")
         self.assertEqual(
             marker["authority_assessment"]["authority_strength"], "weak"
         )
@@ -341,6 +368,10 @@ class AuthorityStrengthTests(unittest.TestCase):
                 allow_weak=True,
             )
         self.assertEqual(native["resume_protocol"], "native-message")
+        self.assertEqual(
+            native["delivery_branch"],
+            "native-weak-authority-opt-in",
+        )
         self.assertTrue(native["allow_weak_authority"])
         self.assertEqual(native["authority"]["authority_strength"], "weak")
         self.assertIs(native["authority"]["weak_authority_accepted"], True)

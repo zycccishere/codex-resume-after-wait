@@ -62,6 +62,7 @@ DEFAULT_MAX_WAIT_SECONDS = 2 * 60 * 60
 DEFAULT_RESUME_RETRY_DELAY_SECONDS = 20 * 60
 DEFAULT_RESUME_RETRY_MAX_ATTEMPTS = 12
 STATE_COLLISION_RETRY_SECONDS = 1
+DEFAULT_STATE_COLLISION_MAX_ATTEMPTS = 900
 WATCHER_STARTUP_TIMEOUT_SECONDS = 10
 DEFAULT_STATE_DIR = str(
     Path(
@@ -263,6 +264,15 @@ def codex_version(codex_binary: Path) -> str:
     return text or f"unknown (returncode={result.returncode})"
 
 
+def is_codex_launcher_token(token: str) -> bool:
+    """Recognize a Codex executable without matching arbitrary arguments."""
+
+    name = Path(token).name.lower()
+    return name in {"codex", "codex.exe", "codex.js"} or (
+        name.startswith("codex-") and not Path(name).suffix
+    )
+
+
 def ancestor_app_server_context() -> dict[str, Any]:
     """Discover the app-server that actually spawned this shell, when visible."""
 
@@ -281,9 +291,21 @@ def ancestor_app_server_context() -> dict[str, Any]:
             tokens = shlex.split(command)
         except ValueError:
             tokens = command.split()
-        if any(Path(token).name == "codex" for token in tokens[:2]):
+        try:
+            app_server_index = tokens.index("app-server")
+        except ValueError:
+            app_server_index = None
+        launcher_tokens = (
+            tokens[:app_server_index]
+            if app_server_index is not None
+            else tokens[:3]
+        )
+        has_codex_launcher = any(
+            is_codex_launcher_token(token) for token in launcher_tokens
+        )
+        if has_codex_launcher:
             saw_codex_process = True
-        if "app-server" in tokens:
+        if app_server_index is not None and has_codex_launcher:
             listen: str | None = None
             auth_env: str | None = None
             for index, token in enumerate(tokens):
@@ -584,6 +606,104 @@ def app_server_auth_env_from_args(args: argparse.Namespace) -> str | None:
     discovered = ancestor_app_server_context()
     auth_env = discovered.get("auth_token_env")
     return str(auth_env) if auth_env else None
+
+
+def classify_delivery_decision(
+    requested_protocol: str,
+    *,
+    route_verified: bool,
+    attachable: bool,
+    native_message_ready: bool,
+    authority_strength: str | None,
+    allow_weak_authority: bool,
+    context_reason: str | None = None,
+    probe_reason: str | None = None,
+    authority_strength_reason: str | None = None,
+) -> dict[str, str]:
+    """Return the single protocol branch used by schedule and doctor.
+
+    Actor routing and delivery authority are independent dimensions.  Keeping
+    this decision pure and named prevents a private owner, unloaded thread, or
+    weak endpoint from falling through to native delivery as the surrounding
+    discovery code evolves.
+    """
+
+    if requested_protocol not in {"auto", "native-message", "marker"}:
+        return {
+            "action": "reject",
+            "branch": "unsupported-protocol",
+            "reason": f"unsupported resume protocol: {requested_protocol}",
+        }
+    if not route_verified:
+        return {
+            "action": "reject",
+            "branch": "unverified-owner-route",
+            "reason": (
+                "the complete actor-to-owner route is unverified; neither native nor "
+                "marker delivery can preserve the cross-fork job fence"
+            ),
+        }
+    if requested_protocol == "marker":
+        return {
+            "action": "marker",
+            "branch": "explicit-marker",
+            "reason": "marker delivery was explicitly requested",
+        }
+    if not attachable:
+        reason = context_reason or "the owner exposes no attachable app-server endpoint"
+        return {
+            "action": "reject" if requested_protocol == "native-message" else "marker",
+            "branch": (
+                "native-rejected-owner-not-attachable"
+                if requested_protocol == "native-message"
+                else "marker-owner-not-attachable"
+            ),
+            "reason": reason,
+        }
+    if not native_message_ready:
+        reason = probe_reason or "the exact owner is not positively loaded on this authority"
+        return {
+            "action": "reject" if requested_protocol == "native-message" else "marker",
+            "branch": (
+                "native-rejected-owner-not-ready"
+                if requested_protocol == "native-message"
+                else "marker-owner-not-ready"
+            ),
+            "reason": reason,
+        }
+    if authority_strength == "strong":
+        return {
+            "action": "native-message",
+            "branch": "native-strong-authority",
+            "reason": "the loaded owner is behind the exact fenced ancestor Unix authority",
+        }
+    if authority_strength == "weak":
+        reason = authority_strength_reason or "the owner authority has only weak instance binding"
+        if allow_weak_authority:
+            return {
+                "action": "native-message",
+                "branch": "native-weak-authority-opt-in",
+                "reason": reason,
+            }
+        return {
+            "action": "reject" if requested_protocol == "native-message" else "marker",
+            "branch": (
+                "native-rejected-weak-authority"
+                if requested_protocol == "native-message"
+                else "marker-weak-authority"
+            ),
+            "reason": reason,
+        }
+    reason = authority_strength_reason or "the owner authority strength is unavailable"
+    return {
+        "action": "reject" if requested_protocol == "native-message" else "marker",
+        "branch": (
+            "native-rejected-unclassified-authority"
+            if requested_protocol == "native-message"
+            else "marker-unclassified-authority"
+        ),
+        "reason": reason,
+    }
 
 
 class OwnerRoutingError(RuntimeError):
@@ -2210,10 +2330,9 @@ def command_schedule(args: argparse.Namespace) -> int:
     authority: dict[str, Any] | None = None
     authority_assessment: dict[str, Any] | None = None
     allow_weak_authority = bool(getattr(args, "allow_weak_authority", False))
-    selected_protocol = requested_protocol
+    probe_reason: str | None = None
     if (
         requested_protocol in {"auto", "native-message"}
-        and owner_route.get("route_verified")
         and app_server_context.get("attachable") is True
     ):
         protocol_probe = inspect_native_thread(
@@ -2221,63 +2340,74 @@ def command_schedule(args: argparse.Namespace) -> int:
             owner_thread_id,
             bearer_token_env=auth_token_env,
         )
-        if protocol_probe.get("native_message_ready"):
+        probe_reason = str(
+            protocol_probe.get("error")
+            or protocol_probe.get("thread_status")
+            or "the exact owner thread is not loaded in this attachable app-server"
+        )
+        if protocol_probe.get("native_message_ready") and isinstance(
+            protocol_probe.get("authority"), dict
+        ):
             authority = dict(protocol_probe["authority"])
             authority_assessment = assess_authority_strength(
                 app_server_context,
                 authority,
             )
             authority.update(authority_assessment)
-            authority["weak_authority_accepted"] = bool(
-                authority["authority_strength"] == "weak" and allow_weak_authority
-            )
-            if auth_token_env:
-                authority["credential_ref"] = {
-                    "kind": "environment",
-                    "name": auth_token_env,
-                }
-            if (
-                authority["authority_strength"] == "strong"
-                or allow_weak_authority
-            ):
-                selected_protocol = "native-message"
-            elif requested_protocol == "native-message":
-                fatal(
-                    "Native message delivery has only weak authority binding: "
-                    f"{authority['authority_strength_reason']}. Use marker delivery, or pass "
-                    "--allow-weak-authority only after accepting endpoint reuse/restart risk."
-                )
-            else:
-                selected_protocol = "marker"
-                protocol_fallback_reason = (
-                    "native authority is weak and was not explicitly accepted: "
-                    f"{authority['authority_strength_reason']}"
-                )
-                authority = None
-        elif requested_protocol == "native-message":
-            fatal(
-                "Native message delivery is unavailable on the requested owner authority: "
-                f"{protocol_probe.get('error') or protocol_probe.get('thread_status') or 'not loaded'}"
-            )
-        else:
-            selected_protocol = "marker"
-            protocol_fallback_reason = str(
-                protocol_probe.get("error")
-                or "the exact owner thread is not loaded in this attachable app-server"
-            )
-    elif requested_protocol in {"auto", "native-message"}:
-        if requested_protocol == "native-message":
-            reason = app_server_context.get("reason") or (
-                "native message delivery requires a fully verified actor-to-owner route"
-            )
-            fatal(f"Native message delivery is unavailable: {reason}.")
-        selected_protocol = "marker"
-        protocol_fallback_reason = str(
+
+    delivery_decision = classify_delivery_decision(
+        requested_protocol,
+        route_verified=bool(owner_route.get("route_verified")),
+        attachable=app_server_context.get("attachable") is True,
+        native_message_ready=bool(
+            protocol_probe
+            and protocol_probe.get("native_message_ready")
+            and isinstance(protocol_probe.get("authority"), dict)
+        ),
+        authority_strength=(
+            str(authority_assessment.get("authority_strength"))
+            if authority_assessment
+            else None
+        ),
+        allow_weak_authority=allow_weak_authority,
+        context_reason=str(
             app_server_context.get("reason")
             or "the verified owner authority is not externally attachable"
+        ),
+        probe_reason=probe_reason,
+        authority_strength_reason=(
+            str(authority_assessment.get("authority_strength_reason"))
+            if authority_assessment
+            else None
+        ),
+    )
+    if delivery_decision["action"] == "reject":
+        suffix = (
+            " Use marker delivery, or pass --allow-weak-authority only after accepting "
+            "endpoint reuse/restart risk."
+            if delivery_decision["branch"] == "native-rejected-weak-authority"
+            else ""
         )
-    elif requested_protocol != "marker":
-        fatal(f"Unsupported resume protocol: {requested_protocol}")
+        fatal(
+            "Native message delivery is unavailable: "
+            f"{delivery_decision['reason']}.{suffix}"
+        )
+    selected_protocol = delivery_decision["action"]
+    if selected_protocol == "native-message":
+        if authority is None:
+            fatal("Native message delivery selected without an authority descriptor.")
+        authority["weak_authority_accepted"] = bool(
+            authority["authority_strength"] == "weak" and allow_weak_authority
+        )
+        if auth_token_env:
+            authority["credential_ref"] = {
+                "kind": "environment",
+                "name": auth_token_env,
+            }
+    else:
+        if requested_protocol == "auto":
+            protocol_fallback_reason = delivery_decision["reason"]
+        authority = None
 
     owner_ledger_key = (
         owner_thread_id
@@ -2304,6 +2434,8 @@ def command_schedule(args: argparse.Namespace) -> int:
         "protocol_version": PROTOCOL_VERSION,
         "resume_protocol_requested": requested_protocol,
         "resume_protocol": selected_protocol,
+        "delivery_branch": delivery_decision["branch"],
+        "delivery_decision_reason": delivery_decision["reason"],
         "authority": authority,
         "authority_assessment": authority_assessment,
         "authority_epoch": 1 if authority else None,
@@ -2337,6 +2469,10 @@ def command_schedule(args: argparse.Namespace) -> int:
         "dry_run_resume": bool(args.dry_run_resume),
         "resume_retry_delay_seconds": max(int(args.resume_retry_delay_seconds), 1),
         "resume_retry_max_attempts": max(int(args.resume_retry_max_attempts), 0),
+        "state_collision_max_attempts": max(
+            int(args.state_collision_max_attempts),
+            0,
+        ),
         "continuation_prompt_text": prompt_text or "",
         "note": args.note or "",
     }
@@ -2403,6 +2539,8 @@ def command_schedule(args: argparse.Namespace) -> int:
             "target": target_summary(target),
             "max_wait_seconds": max_wait_seconds,
             "resume_protocol": selected_protocol,
+            "delivery_branch": delivery_decision["branch"],
+            "delivery_decision_reason": delivery_decision["reason"],
             "native_at_most_once": selected_protocol == "native-message",
             "strict_exactly_once": False,
             "will_wake_idle_thread": selected_protocol == "native-message",
@@ -2613,6 +2751,15 @@ def dispatch_native_message(
         int(task_payload.get("resume_retry_max_attempts", DEFAULT_RESUME_RETRY_MAX_ATTEMPTS)),
         0,
     )
+    collision_max_attempts = max(
+        int(
+            task_payload.get(
+                "state_collision_max_attempts",
+                DEFAULT_STATE_COLLISION_MAX_ATTEMPTS,
+            )
+        ),
+        0,
+    )
     acknowledgement_timeout = max(
         int(task_payload.get("delivery_ack_timeout_seconds") or 30),
         1,
@@ -2632,6 +2779,11 @@ def dispatch_native_message(
         1
         for row in persisted_entry.get("submission_deferrals", [])
         if isinstance(row, dict) and row.get("classification") != "state_collision"
+    )
+    collision_budget_used = sum(
+        1
+        for row in persisted_entry.get("submission_deferrals", [])
+        if isinstance(row, dict) and row.get("classification") == "state_collision"
     )
     sync_job_reservation_from_ledger(task_payload, persisted_entry)
     if persisted_entry["state"] == "ACCEPTED":
@@ -2963,10 +3115,31 @@ def dispatch_native_message(
                 # The owner moved between thread/read and submission, or is in
                 # a temporary Review/Compact turn.  The negative response is
                 # safe to retry, but a 20-minute authority backoff would make
-                # sequential steer unusable.  Collision retries do not consume
-                # the bounded authority/error budget.
-                time.sleep(STATE_COLLISION_RETRY_SECONDS)
-                continue
+                # sequential steer unusable.  Use a separate durable budget so
+                # a permanently non-steerable owner cannot hold this FIFO and
+                # watcher forever.
+                collision_budget_used += 1
+                collisions_remaining = (
+                    collision_max_attempts == 0
+                    or collision_budget_used < collision_max_attempts
+                )
+                if collisions_remaining:
+                    time.sleep(STATE_COLLISION_RETRY_SECONDS)
+                    continue
+                ledger.block_next_ready(
+                    task_id_value,
+                    token,
+                    generation,
+                    "state-collision retry limit reached without submission",
+                )
+                finish_job_reservation(task_payload, "blocked")
+                update_delivery_task(
+                    task_file,
+                    phase="native_message_blocked",
+                    status="state_collision_retries_exhausted",
+                    delivery_attempts=attempts,
+                )
+                return 4
             if rejection_kind == "permanent":
                 ledger.block_next_ready(
                     task_id_value,
@@ -3578,12 +3751,47 @@ def command_doctor(args: argparse.Namespace) -> int:
             dict(report["authority"]),
         )
     allow_weak_authority = bool(getattr(args, "allow_weak_authority", False))
-    strength_accepted = bool(
-        authority_assessment
-        and (
-            authority_assessment["authority_strength"] == "strong"
-            or allow_weak_authority
-        )
+    decision_arguments = {
+        "route_verified": bool(
+            owner_route.get("route_verified") and routing_error is None
+        ),
+        "attachable": app_server_context.get("attachable") is True,
+        "native_message_ready": bool(
+            report.get("native_message_ready")
+            and isinstance(report.get("authority"), dict)
+        ),
+        "authority_strength": (
+            str(authority_assessment.get("authority_strength"))
+            if authority_assessment
+            else None
+        ),
+        "allow_weak_authority": allow_weak_authority,
+        "context_reason": str(
+            app_server_context.get("reason")
+            or "the verified owner authority is not externally attachable"
+        ),
+        "probe_reason": str(
+            report.get("error")
+            or report.get("thread_status")
+            or "the exact owner is not positively loaded on this authority"
+        ),
+        "authority_strength_reason": (
+            str(authority_assessment.get("authority_strength_reason"))
+            if authority_assessment
+            else None
+        ),
+    }
+    auto_decision = classify_delivery_decision(
+        "auto",
+        **decision_arguments,
+    )
+    native_decision = classify_delivery_decision(
+        "native-message",
+        **decision_arguments,
+    )
+    marker_decision = classify_delivery_decision(
+        "marker",
+        **decision_arguments,
     )
     preferred = resolve_codex_binary(args.codex_bin)
     path_binary_value = shutil.which("codex")
@@ -3599,13 +3807,19 @@ def command_doctor(args: argparse.Namespace) -> int:
             "actor_inferred_from_owner": actor_inferred_from_owner,
             "owner_route": owner_route,
             "owner_routing_error": routing_error,
+            "delivery_branch": auto_decision["branch"],
+            "recommended_protocol": auto_decision["action"],
+            "auto_delivery_decision": auto_decision,
+            "explicit_native_decision": native_decision,
+            "explicit_marker_decision": marker_decision,
             "native_message_protocol": (
                 "available (authority-bound FIFO with userMessage acknowledgement)"
-                if report.get("native_message_ready")
-                and strength_accepted
-                and owner_route.get("route_verified")
-                and routing_error is None
-                and app_server_context.get("attachable") is True
+                if native_decision["action"] == "native-message"
+                else "unavailable"
+            ),
+            "marker_protocol": (
+                "available (owner-bound manual claim; does not wake an idle task)"
+                if marker_decision["action"] == "marker"
                 else "unavailable"
             ),
             "authority_assessment": authority_assessment,
@@ -4346,8 +4560,10 @@ def build_parser() -> argparse.ArgumentParser:
     schedule.add_argument(
         "--app-server-endpoint",
         help=(
-            "Exact owning app-server endpoint: unix://, ws://, or wss://. Defaults to the "
-            "managed daemon Unix socket; explicit remote TUI sessions must pass their endpoint."
+            "Exact owning app-server endpoint: unix://, ws://, or wss://. The scheduler first "
+            "uses a proven ancestor listener; otherwise the managed daemon socket is only a "
+            "routing diagnostic endpoint. Explicit remote TUI sessions should pass their exact "
+            "connect endpoint when ancestor discovery is unavailable."
         ),
     )
     schedule.add_argument(
@@ -4392,6 +4608,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Maximum attempts only when no continuation was accepted. Ambiguous submission "
             "outcomes are never retried. "
             "Use 0 for unlimited retries. Default: 12."
+        ),
+    )
+    schedule.add_argument(
+        "--state-collision-max-attempts",
+        type=int,
+        default=int(
+            os.environ.get(
+                "CODEX_WAIT_STATE_COLLISION_MAX_ATTEMPTS",
+                DEFAULT_STATE_COLLISION_MAX_ATTEMPTS,
+            )
+        ),
+        help=(
+            "Maximum one-second retries after explicit no-active/mismatched-turn or "
+            "Review/Compact rejection. This budget persists across watcher recovery and is "
+            "separate from authority retries. Use 0 only for an intentional unlimited wait. "
+            "Default: 900."
         ),
     )
     schedule.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="State directory for tasks and logs.")
