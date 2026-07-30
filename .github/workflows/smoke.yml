@@ -6,7 +6,11 @@ on:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,10 +20,24 @@ jobs:
         run: python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py --help
       - name: Status help
         run: python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py status --help
+      - name: Protocol help
+        run: |
+          python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py doctor --help
+          python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py pending --help
+          python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py reconcile --help
+          python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py recover --help
+          python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py freeze --help
+          python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py rebind --help
       - name: Serve help
         run: python3 skills/blocking-wait-handoff/scripts/codex_wait_handoff.py serve --help
       - name: Compile scripts
         run: |
           python3 -m py_compile \
+            skills/blocking-wait-handoff/scripts/codex_app_server.py \
+            skills/blocking-wait-handoff/scripts/handoff_ledger.py \
+            skills/blocking-wait-handoff/scripts/job_registry.py \
+            skills/blocking-wait-handoff/scripts/process_identity.py \
             skills/blocking-wait-handoff/scripts/codex_wait_handoff.py \
             skills/blocking-wait-handoff/scripts/wait_handoff_dashboard.py
+      - name: Protocol tests
+        run: python3 -m unittest discover -s tests -v
