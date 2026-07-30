@@ -450,11 +450,13 @@ class OrderedLedgerTests(unittest.TestCase):
             ledger = self.make_ledger(temp)
             reservation = self.register(ledger, 1)
             lock_inode = ledger.lock_path.stat().st_ino
-            json_inode = ledger.json_path.stat().st_ino
+            registered_inode = ledger.json_path.stat().st_ino
             ledger.mark_ready(*reservation)
+            ready_inode = ledger.json_path.stat().st_ino
+            self.assertNotEqual(ready_inode, registered_inode)
             ledger.begin_next_submission(reservation[0])
             self.assertEqual(ledger.lock_path.stat().st_ino, lock_inode)
-            self.assertNotEqual(ledger.json_path.stat().st_ino, json_inode)
+            self.assertNotEqual(ledger.json_path.stat().st_ino, ready_inode)
             with self.assertRaises(InvalidTransition):
                 ledger.rebind_authority(1, AUTHORITY_B)
 
