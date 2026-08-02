@@ -1,4 +1,4 @@
 interface:
   display_name: "Blocking Wait Handoff"
-  short_description: "Deliver long-wait events to the durable Codex owner"
-  default_prompt: "Use $blocking-wait-handoff to safely deliver this process completion to its durable owner task."
+  short_description: "Continue Codex after long-running processes"
+  default_prompt: "Use $blocking-wait-handoff to watch this already-running process and continue its durable owner task when it exits."
