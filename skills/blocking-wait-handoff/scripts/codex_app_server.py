@@ -68,7 +68,8 @@ def default_app_server_socket() -> Path:
     configured = os.environ.get("CODEX_WAIT_APP_SERVER_SOCKET")
     if configured:
         return Path(configured).expanduser().resolve()
-    return default_codex_home() / "app-server-control" / "app-server-control.sock"
+    # The managed-daemon path may be a symlink; match explicit Unix URI parsing.
+    return (default_codex_home() / "app-server-control" / "app-server-control.sock").resolve()
 
 
 def default_app_server_endpoint() -> str:
